@@ -27,13 +27,15 @@ def iter_playlist_files(walkman_root: Path) -> list[Path]:
         folder = walkman_root / folder_name
         if folder.exists() and folder.is_dir():
             paths.extend(sorted(folder.glob("*.m3u")))
-    # De-duplicate by file identity (inode) to avoid duplicates on case-insensitive filesystems.
+    # De-duplicate by file identity (inode) to avoid duplicates on case-insensitive
+    # filesystems when folder aliases differ only by case.
     unique: dict[tuple[int, int], Path] = {}
     for p in paths:
         try:
             st = p.stat()
             key = (st.st_dev, st.st_ino)
         except OSError:
+            # Fallback key if stat fails.
             key = hash(str(p.resolve()).lower()), 0
         if key not in unique:
             unique[key] = p.resolve()
