@@ -27,21 +27,43 @@ def iter_playlist_files(walkman_root: Path) -> list[Path]:
         folder = walkman_root / folder_name
         if folder.exists() and folder.is_dir():
             paths.extend(sorted(folder.glob("*.m3u")))
-    # de-duplicate same path discovered twice
-    unique = sorted({p.resolve() for p in paths})
-    return unique
+    # De-duplicate by file identity (inode) to avoid duplicates on case-insensitive filesystems.
+    unique: dict[tuple[int, int], Path] = {}
+    for p in paths:
+        try:
+            st = p.stat()
+            key = (st.st_dev, st.st_ino)
+        except OSError:
+            key = hash(str(p.resolve()).lower()), 0
+        if key not in unique:
+            unique[key] = p.resolve()
+    return sorted(unique.values())
 
 
 def parse_entries(playlist: Path) -> list[str]:
-    lines = playlist.read_text(encoding="utf-8-sig", errors="replace").splitlines()
-    return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+    # Read raw bytes so malformed/binary playlist files do not crash audit.
+    raw = playlist.read_bytes()
+    text = raw.decode("utf-8-sig", errors="replace")
+    lines = text.splitlines()
+
+    entries: list[str] = []
+    for line in lines:
+        item = line.strip().replace("\x00", "")
+        if not item or item.startswith("#"):
+            continue
+        entries.append(item)
+    return entries
 
 
-def resolve_entry(entry: str, playlist: Path) -> Path:
-    p = Path(entry)
-    if p.is_absolute():
-        return p.resolve()
-    return (playlist.parent / p).resolve()
+def resolve_entry(entry: str, playlist: Path) -> Path | None:
+    try:
+        p = Path(entry)
+        if p.is_absolute():
+            return p.resolve()
+        return (playlist.parent / p).resolve()
+    except (ValueError, OSError):
+        # Handles malformed entries (e.g., embedded null byte).
+        return None
 
 
 def audit_playlist(playlist: Path, music_root: Path) -> dict[str, object]:
@@ -51,7 +73,7 @@ def audit_playlist(playlist: Path, music_root: Path) -> dict[str, object]:
 
     for entry in entries:
         target = resolve_entry(entry, playlist)
-        if not target.exists():
+        if target is None or not target.exists():
             missing += 1
             continue
         try:
@@ -82,6 +104,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete .m3u files with zero playable entries",
     )
+    parser.add_argument(
+        "--remove-name-duplicates",
+        action="store_true",
+        help="For duplicate playlist names, keep one preferred copy and delete others",
+    )
     return parser.parse_args()
 
 
@@ -99,6 +126,34 @@ def main() -> None:
     reports = [audit_playlist(p, music_root) for p in playlists]
 
     deleted = 0
+    duplicates_deleted = 0
+
+    if args.remove_name_duplicates:
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for r in reports:
+            grouped.setdefault(str(r["name"]).lower(), []).append(r)
+
+        for _, group in grouped.items():
+            if len(group) < 2:
+                continue
+
+            def score(row: dict[str, object]) -> tuple[int, int, int]:
+                # Lower score is better.
+                path = Path(str(row["file"]))
+                in_music = int(path.parent.resolve() == music_root)
+                issues = int(row["missing_entries"]) + int(row["outside_music_root"]) + (100 if bool(row["is_appledouble"]) else 0)
+                # Prefer in MUSIC folder and fewer issues.
+                return (-in_music, issues, len(str(path)))
+
+            keep = min(group, key=score)
+            for row in group:
+                if row is keep:
+                    continue
+                file_path = Path(str(row["file"]))
+                if file_path.exists():
+                    file_path.unlink()
+                    duplicates_deleted += 1
+
     for r in reports:
         file_path = Path(str(r["file"]))
         should_delete = False
@@ -134,6 +189,8 @@ def main() -> None:
     if deleted:
         print()
         print(f"Deleted playlists: {deleted}")
+    if duplicates_deleted:
+        print(f"Deleted duplicate-name playlists: {duplicates_deleted}")
 
 
 if __name__ == "__main__":
